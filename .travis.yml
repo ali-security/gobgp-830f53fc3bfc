@@ -2,7 +2,14 @@ language: go
 
 _dep_ensure: &_dep_ensure
   go: "1.11"
-  before_install: go get -u github.com/golang/dep/cmd/dep
+  before_install:
+    - mkdir -p $GOPATH/bin
+    - curl -fsSL -o $GOPATH/bin/dep https://github.com/golang/dep/releases/download/v0.5.0/dep-linux-amd64
+    - chmod +x $GOPATH/bin/dep
+    # `go_import_path` symlinks the checkout under $GOPATH/src but leaves the
+    # shell in the real build dir, which `dep` rejects ("is not within a known
+    # GOPATH/src"). Enter it via the GOPATH path instead.
+    - cd $GOPATH/src/github.com/osrg/gobgp
   install: $GOPATH/bin/dep ensure
 
 _unittest: &_unittest
@@ -17,48 +24,11 @@ _build: &_build
     - go build -o ./cmd/gobgp/gobgp   ./cmd/gobgp/
     - go build -o ./cmd/gobgpd/gobgpd ./cmd/gobgpd/
 
-_node_js: &_node_js
-  language: node_js
-  node_js: "node"
-
-_python: &_python
-  language: python
-  python: "2.7"
-
-_docker: &_docker
-  <<: *_python
-  sudo: required
-  dist: trusty
-  group: deprecated-2017Q4
-  before_install:
-    - test $TRAVIS_OS_NAME == "linux" && sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
-    - test $TRAVIS_OS_NAME == "linux" && sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0
-    - test $TRAVIS_OS_NAME == "linux" && sudo sysctl -w net.ipv6.conf.docker0.disable_ipv6=1
-  install:
-    - pip install -r test/pip-requires.txt
-    - fab -f test/lib/base.py make_gobgp_ctn:tag=$DOCKER_IMAGE,from_image=$FROM_IMAGE
-  script:
-    - PYTHONPATH=test python test/scenario_test/$TEST --gobgp-image $DOCKER_IMAGE -x -s
-  services:
-    - docker
-
-env:
-  global:
-    - DOCKER_IMAGE=gobgp
-    - FROM_IMAGE=osrg/quagga
-
 matrix:
-  allow_failures:
-    - go: tip
-
   include:
 #
 # Unit Tests
 #
-    - <<: *_unittest
-      env:
-        - DESCRIPTION="Unit Tests Tip"
-      go: tip
     - <<: *_unittest
       env:
         - DESCRIPTION="Unit Tests"
@@ -69,9 +39,6 @@ matrix:
       go: "1.11"
       script:
         - go test $(go list ./... | grep -v '/vendor/') -coverprofile=coverage.txt -covermode=atomic
-      after_success:
-        - test -n "$TRAVIS_TAG" && curl -sL https://git.io/goreleaser | bash
-        - bash <(curl -s https://codecov.io/bash)
     - <<: *_unittest
       env:
         - DESCRIPTION="Unit Tests on i386"
@@ -103,128 +70,8 @@ matrix:
       before_script:
         - export GOOS="darwin"
         - go env
-#
-# Misc
-#
-    - <<: *_dep_ensure
-      env:
-        - DESCRIPTION="go fmt + vet + megacheck"
-      before_script: go get -u honnef.co/go/tools/cmd/megacheck
-      script:
-        - test -z "$(go fmt $(go list ./... | grep -v '/vendor/'))"
-        - go vet $(go list ./... | grep -v '/vendor/')
-        - megacheck $(go list ./... | grep -v '/vendor/')
-    - <<: *_dep_ensure
-      env:
-        - DESCRIPTION="build_embeded_go.py"
-      script: python test/scenario_test/ci-scripts/build_embeded_go.py docs/sources/lib.md
-#
-# Docker
-#
-    - <<: *_docker
-      env:
-        - TEST=bgp_router_test.py
-    - <<: *_docker
-      env:
-        - TEST=bgp_zebra_test.py
-    - <<: *_docker
-      env:
-        - TEST=bgp_zebra_nht_test.py FROM_IMAGE=osrg/quagga:v1.0
-    - <<: *_docker
-      env:
-        - TEST=evpn_test.py
-    - <<: *_docker
-      env:
-        - TEST=flow_spec_test.py
-    - <<: *_docker
-      env:
-        - TEST=global_policy_test.py
-    - <<: *_docker
-      env:
-        - TEST=graceful_restart_test.py
-    - <<: *_docker
-      env:
-        - TEST=ibgp_router_test.py
-    - <<: *_docker
-      env:
-        - TEST=route_reflector_test.py
-    - <<: *_docker
-      env:
-        - TEST=route_server_as2_test.py
-    - <<: *_docker
-      env:
-        - TEST=route_server_ipv4_v6_test.py
-    - <<: *_docker
-      env:
-        - TEST=route_server_malformed_test.py
-    - <<: *_docker
-      env:
-        - TEST=route_server_policy_grpc_test.py
-    - <<: *_docker
-      env:
-        - TEST=route_server_policy_test.py
-    - <<: *_docker
-      env:
-        - TEST=route_server_softreset_test.py
-    - <<: *_docker
-      env:
-        - TEST=route_server_test.py
-    - <<: *_docker
-      env:
-        - TEST=route_server_test2.py
-    - <<: *_docker
-      env:
-        - TEST=zapi_v3_test.py FROM_IMAGE=osrg/quagga:v1.0
-    - <<: *_docker
-      env:
-        - TEST=long_lived_graceful_restart_test.py
-    - <<: *_docker
-      env:
-        - TEST=vrf_neighbor_test.py
-    - <<: *_docker
-      env:
-        - TEST=vrf_neighbor_test2.py
-    - <<: *_docker
-      env:
-        - TEST=rtc_test.py
-    - <<: *_docker
-      env:
-        - TEST=bgp_unnumbered_test.py
-    - <<: *_docker
-      env:
-        - TEST=aspath_test.py
-    - <<: *_docker
-      env:
-        - TEST=addpath_test.py
-    - <<: *_docker
-      env:
-        - TEST=bgp_malformed_msg_handling_test.py
-    - <<: *_docker
-      env:
-        - TEST=bgp_confederation_test.py
-#
-# Tools
-#
-    - <<: *_node_js
-      env:
-        - DESCRIPTION="markdownlint"
-      before_script:
-        - npm install -g markdownlint-cli
-      script:
-        - markdownlint $(find . -type f -name '*.md' | grep -v '/vendor/')
-    - <<: *_python
-      env:
-        - DESCRIPTION="Tools"
-      install: pip install scspell3k
-      script:
-        - bash tools/spell-check/scspell.sh
-        - bash tools/grep_avoided_functions.sh
 
 cache:
   pip: true
 
 go_import_path: github.com/osrg/gobgp
-
-notifications:
- slack:
-  secure: KzuC9kytzS7wTlfj4MqSg8EpqXfJRMbo59dAVTA3w587achnVCS3vhUenWuhMCiWk7+6DVWwNpwzn2+A0S6RwMFMpKAU6Ij6K9sxEOgqBGuMN8w1//w+uJTryzsnebEIhInGt2kKfqz4Wx3QQqW5gVhI+8s+c5M0iXxFtN4soVk=

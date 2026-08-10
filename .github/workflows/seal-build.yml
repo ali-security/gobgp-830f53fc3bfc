@@ -1,0 +1,151 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pack:
+    name: Build module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      MODULE_PATH: github.com/osrg/gobgp
+      MODULE_VERSION: v2.0.0+incompatible
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+
+      # The helper lives outside the checkout on purpose: any file written inside
+      # src/ would be packaged into the module zip and break the byte-for-byte
+      # file-set match against proxy.golang.org.
+      - name: Write module-zip helper (outside the checkout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/helper"
+          cat > "$RUNNER_TEMP/helper/create_mod.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                log.Fatal(err)
+              }
+              log.Printf("created %s", os.Args[4])
+          }
+          EOF
+
+      - name: Prepare helper module
+        shell: bash
+        working-directory: ${{ runner.temp }}/helper
+        run: |
+          set -euo pipefail
+          go mod init sealhelper
+          # x/mod v0.24.0 is the last release that builds with Go 1.23.
+          go get golang.org/x/mod@v0.24.0
+
+      - name: Create module zip
+        shell: bash
+        working-directory: ${{ runner.temp }}/helper
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          go run create_mod.go "$MODULE_PATH" "$MODULE_VERSION" \
+            "$GITHUB_WORKSPACE/src" \
+            "$GITHUB_WORKSPACE/dist/$MODULE_VERSION.zip"
+
+      - name: List zip contents
+        shell: bash
+        run: unzip -l "$GITHUB_WORKSPACE/dist/$MODULE_VERSION.zip"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: dist/v2.0.0+incompatible.zip
+          if-no-files-found: error
+
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+    steps:
+      # Keep Go sources and testdata LF on Windows checkouts.
+      - name: Disable git autocrlf (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+
+      # gobgp 2.0.0 predates Go modules (deps came from `dep` + an uncommitted
+      # vendor/). GOPATH mode with `dep` is not workable on these runners, so the
+      # module context is synthesized at runtime and removed again below. It is
+      # never committed: a go.mod in the tree would show up in the module zip and
+      # break the +incompatible file-set match.
+      - name: Synthesize module context
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Module path must be exactly github.com/osrg/gobgp: pkg/packet/bmp and
+          # pkg/packet/mrt import github.com/osrg/gobgp/pkg/packet/bgp.
+          go mod init github.com/osrg/gobgp
+          # testify's own deps need go.sum entries too, else the test build dies
+          # with "missing go.sum entry for ... go-spew". Their versions come from
+          # testify's go.mod via MVS. A whole-module `go mod tidy` is not usable
+          # here: it would walk cmd/ and internal/, which need grpc and the
+          # Linux-only netlink.
+          go get github.com/stretchr/testify@v1.9.0 \
+                 github.com/davecgh/go-spew/spew \
+                 github.com/pmezard/go-difflib/difflib \
+                 gopkg.in/yaml.v3
+
+      # Scope: pkg/packet/... (bgp, bmp, mrt, rtr) depends only on
+      # stretchr/testify. The rest of the tree pulls grpc/protobuf and
+      # vishvananda/netlink, which is Linux-only, so a whole-tree run cannot
+      # compile on macOS or Windows. The full suite runs on Travis (Linux).
+      - name: Run pkg/packet tests
+        shell: bash
+        run: go test -v -count=1 ./pkg/packet/...
+
+      - name: Remove synthesized module files
+        if: always()
+        shell: bash
+        run: rm -f go.mod go.sum
