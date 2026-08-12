@@ -149,3 +149,184 @@ jobs:
         if: always()
         shell: bash
         run: rm -f go.mod go.sum
+
+  # ---------------------------------------------------------------------------
+  # Scenario tests (test/scenario_test/*.py)
+  #
+  # Upstream ran these on Travis under `dist: trusty` / `group: deprecated-2017Q4`
+  # images that Travis has retired, driven by Python 2.7 + fabric 1.x. Both the
+  # images and a system Python 2.7 are gone from current runners, so the legs are
+  # revived here instead: the Python 2.7 driver is containerised, and the gobgpd
+  # under test is built once and shared with the matrix as a Docker image.
+  # ---------------------------------------------------------------------------
+  scenario_image:
+    name: Scenario image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # The checkout must sit at $GOPATH/src/github.com/osrg/gobgp: gobgp 2.0.0
+      # predates modules and its deps are pinned by Gopkg.lock, so the build runs
+      # in GOPATH mode.
+      - name: Checkout into GOPATH
+        uses: actions/checkout@v4
+        with:
+          path: gopath/src/github.com/osrg/gobgp
+
+      # `go get -u github.com/golang/dep/cmd/dep` (what upstream's before_install
+      # used) no longer builds: golang/dep is archived and its master needs a
+      # newer toolchain than the go 1.12 in these images. v0.5.0 is the release
+      # contemporaneous with gobgp 2.0.0.
+      - name: Fetch dep v0.5.0
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/dep" \
+            https://github.com/golang/dep/releases/download/v0.5.0/dep-linux-amd64
+          chmod +x "$RUNNER_TEMP/dep"
+
+      # golang:1.12 rather than the go inside osrg/quagga: `dep ensure` fetches
+      # ~35 repos over HTTPS and that image's trusty-era CA bundle no longer
+      # validates several of them.
+      - name: Build gobgpd/gobgp (dep ensure + go install)
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/gopath:/go" \
+            -v "$RUNNER_TEMP/dep:/usr/local/bin/dep" \
+            -w /go/src/github.com/osrg/gobgp \
+            -e GOPATH=/go -e GO111MODULE=off -e CGO_ENABLED=0 \
+            golang:1.12 \
+            bash -c 'dep ensure -vendor-only && go install ./cmd/gobgpd ./cmd/gobgp'
+          ls -l "$GITHUB_WORKSPACE/gopath/bin"
+
+      # Two base images, mirroring the FROM_IMAGE upstream's `_docker` legs used:
+      # osrg/quagga (quagga 0.99, ZAPI v2) for most tests and osrg/quagga:v1.0
+      # (ZAPI v3) for the zapi_v3 / zebra-nht legs — lib/gobgp.py picks the zebra
+      # binary path from zapi_version, so the two are not interchangeable.
+      # Copying prebuilt binaries in replaces the in-image `dep ensure` that
+      # upstream's `make_gobgp_ctn` did, which cannot run on those images now.
+      - name: Build gobgp test images
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/img"
+          cp "$GITHUB_WORKSPACE/gopath/bin/gobgp" "$GITHUB_WORKSPACE/gopath/bin/gobgpd" "$RUNNER_TEMP/img/"
+          for base in "osrg/quagga gobgp-sealed:ci" "osrg/quagga:v1.0 gobgp-sealed:ci-zapi3"; do
+            set -- $base
+            printf 'FROM %s\nCOPY gobgp /go/bin/gobgp\nCOPY gobgpd /go/bin/gobgpd\n' "$1" \
+              > "$RUNNER_TEMP/img/Dockerfile"
+            docker build -t "$2" -f "$RUNNER_TEMP/img/Dockerfile" "$RUNNER_TEMP/img"
+          done
+          docker save gobgp-sealed:ci gobgp-sealed:ci-zapi3 | gzip > "$RUNNER_TEMP/gobgp-sealed.tar.gz"
+
+      - name: Upload gobgp test images
+        uses: actions/upload-artifact@v4
+        with:
+          name: gobgp-sealed-images
+          path: ${{ runner.temp }}/gobgp-sealed.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  scenario:
+    name: Scenario (${{ matrix.test }})
+    needs: scenario_image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - test: addpath_test.py
+          - test: aspath_test.py
+          - test: bgp_confederation_test.py
+          - test: bgp_malformed_msg_handling_test.py
+          - test: bgp_router_test.py
+          - test: bgp_unnumbered_test.py
+          - test: bgp_zebra_test.py
+          - test: bgp_zebra_nht_test.py
+            image: gobgp-sealed:ci-zapi3
+          - test: evpn_test.py
+          - test: flow_spec_test.py
+          - test: global_policy_test.py
+          - test: graceful_restart_test.py
+          - test: ibgp_router_test.py
+          - test: long_lived_graceful_restart_test.py
+          - test: route_reflector_test.py
+          - test: route_server_as2_test.py
+          - test: route_server_ipv4_v6_test.py
+          - test: route_server_malformed_test.py
+          - test: route_server_policy_grpc_test.py
+          - test: route_server_policy_test.py
+          - test: route_server_softreset_test.py
+          - test: route_server_test.py
+          - test: route_server_test2.py
+          - test: rtc_test.py
+          - test: vrf_neighbor_test.py
+          - test: vrf_neighbor_test2.py
+          - test: zapi_v3_test.py
+            image: gobgp-sealed:ci-zapi3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The same three sysctls upstream's `_docker` anchor set, plus the daemon
+      # flag they did not need (2017 Travis shipped an IPv6-enabled daemon).
+      # route_server_ipv4_v6 peers over IPv6 and bgp_unnumbered pings
+      # ff02::1%eth0, so IPv6 has to be on; but docker0 must keep it *off* on the
+      # host side, or the host itself answers ff02::1 and bgp_unnumbered sees two
+      # neighbours on eth0 and aborts with 'not p2p link'. Disabling it on the
+      # bridge device does not affect the container-side veths, so container
+      # IPv6 over docker0 keeps working.
+      - name: Enable IPv6 on the Docker daemon
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0
+          echo '{"ipv6": true, "fixed-cidr-v6": "fd00:dead:beef::/64", "experimental": true, "ip6tables": true}' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sudo sysctl -w net.ipv6.conf.docker0.disable_ipv6=1
+          docker network inspect bridge --format '{{.EnableIPv6}}'
+
+      - name: Download gobgp test images
+        uses: actions/download-artifact@v4
+        with:
+          name: gobgp-sealed-images
+          path: ${{ runner.temp }}
+
+      - name: Load gobgp test images
+        run: docker load < "$RUNNER_TEMP/gobgp-sealed.tar.gz"
+
+      # The driver has to be a container: ubuntu-latest has no Python 2.7 and no
+      # apt source for one. It talks to the host daemon over the socket, so the
+      # test containers are siblings, not children. ryu/nsenter from
+      # test/pip-requires.txt are left out: nothing under test/lib imports them.
+      - name: Build Python 2.7 driver image
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/driver"
+          curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-24.0.7.tgz \
+            | tar xz -C "$RUNNER_TEMP/driver" --strip-components=1 docker/docker
+          cat > "$RUNNER_TEMP/driver/Dockerfile" <<'EOF'
+          FROM python:2.7-slim
+          COPY docker /usr/local/bin/docker
+          RUN pip install --no-cache-dir \
+                "nose==1.3.7" "toml==0.10.2" "PyYAML==5.4.1" "fabric<2.0.0" \
+                "netaddr==0.8.0" "docker==4.4.4"
+          WORKDIR /work
+          EOF
+          docker build -t gobgp-scenario-driver:py27 "$RUNNER_TEMP/driver"
+
+      # /tmp is bind-mounted at the same path so that lib.base.TEST_BASE_DIR
+      # ('/tmp/gobgp') means one directory to both the driver and the daemon that
+      # mounts it into the test containers. --network host lets the driver reach
+      # the containers' bridge addresses.
+      - name: Run ${{ matrix.test }}
+        run: |
+          set -euo pipefail
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v /tmp:/tmp \
+            -e PYTHONPATH=/work/test \
+            gobgp-scenario-driver:py27 \
+            python "test/scenario_test/${{ matrix.test }}" \
+              --gobgp-image "${{ matrix.image || 'gobgp-sealed:ci' }}" -s
